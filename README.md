@@ -1,387 +1,763 @@
-# 🔌 STM32 Relay & Sensor Control
-
-Hệ thống điều khiển relay và giám sát nhiệt độ/độ ẩm từ xa qua giao thức HTTP.  
-Mạch STM32 kết nối Internet qua module **W5500**, giao tiếp với server PHP, giao diện web cập nhật realtime.
-
+# 📖 Giải thích chi tiết `http_client.c`
+ 
 ---
-
-## 📋 Mục lục
-
-- [Tính năng](#tính-năng)
-- [Kiến trúc hệ thống](#kiến-trúc-hệ-thống)
-- [Phần cứng](#phần-cứng)
-- [Cấu trúc dự án](#cấu-trúc-dự-án)
-- [Server — Cài đặt](#server--cài-đặt)
-- [API Reference](#api-reference)
-- [Cấu hình STM32](#cấu-hình-stm32)
-- [Giao diện Web](#giao-diện-web)
-- [Test bằng Python](#test-bằng-python)
-- [Lưu ý kỹ thuật](#lưu-ý-kỹ-thuật)
-
+ 
+## Mục lục
+ 
+1. [Tổng quan kiến trúc](#1-tổng-quan-kiến-trúc)
+2. [Biến nội bộ](#2-biến-nội-bộ)
+3. [float_to_str()](#3-float_to_str)
+4. [resolve_server_ip() — DNS](#4-resolve_server_ip--dns)
+5. [open_socket()](#5-open_socket)
+6. [tcp_connect()](#6-tcp_connect)
+7. [tcp_send()](#7-tcp_send)
+8. [tcp_receive()](#8-tcp_receive)
+9. [extract_body()](#9-extract_body)
+10. [do_request() — Lõi chung](#10-do_request--lõi-chung)
+11. [parse_relay_state()](#11-parse_relay_state)
+12. [process_relay_response()](#12-process_relay_response)
+13. [http_get() / http_post()](#13-http_get--http_post)
+14. [http_post_sensor()](#14-http_post_sensor)
+15. [http_client_init() / http_client_run()](#15-http_client_init--http_client_run)
+16. [Luồng dữ liệu đầy đủ](#16-luồng-dữ-liệu-đầy-đủ)
+17. [Các lỗi thường gặp](#17-các-lỗi-thường-gặp)
 ---
-
-## ✨ Tính năng
-
-| Tính năng | Mô tả |
-|-----------|-------|
-| **Điều khiển Relay** | Bật/tắt tối đa 4 relay qua web, STM32 tự đồng bộ trạng thái mỗi 500ms |
-| **Giám sát nhiệt độ** | Mạch đẩy dữ liệu lên server mỗi 2 giây |
-| **Giám sát độ ẩm** | Hỗ trợ tuỳ chọn (truyền `-1` nếu không có cảm biến) |
-| **Giao diện Web** | Dashboard realtime, biểu đồ lịch sử, hiển thị trạng thái LIVE/OFFLINE |
-| **DNS động** | Tự resolve domain, tự re-resolve khi mất kết nối |
-| **Không cần float printf** | Tự convert float → string, không cần flag `-u _printf_float` |
-
+ 
+## 1. Tổng quan kiến trúc
+ 
+Module được thiết kế theo **mô hình phân tầng** — mỗi tầng chỉ biết tầng ngay bên dưới nó:
+ 
+```
+┌─────────────────────────────────────────────────────┐
+│  TẦNG ỨNG DỤNG (Application Layer)                  │
+│                                                      │
+│  http_client_run()     → tự động GET relay           │
+│  http_post_sensor()    → gửi nhiệt độ/độ ẩm         │
+└────────────────────────┬────────────────────────────┘
+                         │ gọi
+┌────────────────────────▼────────────────────────────┐
+│  TẦNG HTTP (HTTP Layer)                              │
+│                                                      │
+│  http_get(path, ...)   → build GET request           │
+│  http_post(path, ...)  → build POST request          │
+└────────────────────────┬────────────────────────────┘
+                         │ gọi
+┌────────────────────────▼────────────────────────────┐
+│  TẦNG REQUEST (Request Engine)                       │
+│                                                      │
+│  do_request()          → thực thi 1 vòng request    │
+│  ensure_ip()           → đảm bảo đã có IP           │
+└──────┬──────────────┬──────────────┬────────────────┘
+       │              │              │
+┌──────▼──────┐ ┌─────▼──────┐ ┌────▼───────────────┐
+│ open_socket │ │tcp_connect │ │tcp_send / tcp_receive│
+│             │ │            │ │extract_body          │
+└──────┬──────┘ └─────┬──────┘ └────────────────────┘
+       │              │
+┌──────▼──────────────▼──────────────────────────────┐
+│  TẦNG W5500 (Driver Layer)                          │
+│  socket() / connect() / send() / recv()             │
+│  getSn_SR() / getSn_RX_RSR()                        │
+└─────────────────────────────────────────────────────┘
+```
+ 
+**Nguyên tắc thiết kế:**
+- Hàm `static` = private, chỉ dùng nội bộ trong file `.c`
+- Hàm không có `static` = public, khai báo trong `.h`
+- `do_request()` là **lõi chung** — GET và POST đều đi qua đây
 ---
-
-## 🏗 Kiến trúc hệ thống
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        Internet                             │
-└───────────────────┬─────────────────┬───────────────────────┘
-                    │                 │
-          ┌─────────▼──────┐   ┌──────▼──────────┐
-          │   STM32 + W5500 │   │  Trình duyệt Web │
-          │                │   │   (index.html)   │
-          │ • DNS resolve  │   │                  │
-          │ • GET relay    │   │ • Poll relay 3s  │
-          │   mỗi 500ms    │   │ • Poll sensor 2s │
-          │ • POST sensor  │   │ • Biểu đồ lịch sử│
-          │   mỗi 2s       │   └──────┬───────────┘
-          └─────────┬──────┘          │
-                    │    HTTP/TCP      │
-          ┌─────────▼──────────────────▼──────────┐
-          │              Server PHP                │
-          │                                        │
-          │  api.php                               │
-          │  ├── GET  /api.php          → relay    │
-          │  ├── POST /api.php          → relay    │
-          │  ├── GET  ?action=sensor    → sensor   │
-          │  ├── POST ?action=sensor    → sensor   │
-          │  └── GET  ?action=sensor_history       │
-          │                                        │
-          │  relay_state.json   (trạng thái relay) │
-          │  sensor_latest.json (dữ liệu mới nhất) │
-          │  sensor_history.json (tối đa 60 điểm) │
-          └────────────────────────────────────────┘
-```
-
----
-
-## 🔧 Phần cứng
-
-### Linh kiện cần thiết
-
-| Linh kiện | Số lượng | Ghi chú |
-|-----------|----------|---------|
-| STM32F103 (hoặc tương đương) | 1 | Đã test trên F103C8T6 |
-| Module Ethernet W5500 | 1 | Giao tiếp SPI |
-| Module Relay 4 kênh | 1 | Active LOW |
-| Cảm biến DHT11 / DHT22 / DS18B20 | 1 | Tuỳ chọn |
-| Nguồn 5V / 3.3V | 1 | |
-
-### Sơ đồ kết nối W5500 ↔ STM32
-
-```
-W5500 Pin    →   STM32 Pin
-─────────────────────────
-VCC          →   3.3V
-GND          →   GND
-SCLK         →   PA5  (SPI1_SCK)
-MISO         →   PA6  (SPI1_MISO)
-MOSI         →   PA7  (SPI1_MOSI)
-CS  (SCS)    →   PA4  (GPIO Output)
-RST          →   PC7  (GPIO Output)
-INT          →   (tuỳ chọn)
-```
-
-### Relay ↔ STM32
-
-```
-Relay Module    →   STM32 Pin
-──────────────────────────────
-IN1 (Relay 1)   →   PC9  (Active LOW)
-IN2 (Relay 2)   →   PC8  (mở rộng)
-IN3 (Relay 3)   →   PB8  (mở rộng)
-IN4 (Relay 4)   →   PB9  (mở rộng)
-VCC             →   5V
-GND             →   GND
-```
-
----
-
-## 📁 Cấu trúc dự án
-
-```
-project/
-│
-├── STM32/                          # Firmware STM32 (STM32CubeIDE)
-│   └── Ethernet/W5500/
-│       ├── http_client.h           # API header — GET / POST / sensor
-│       └── http_client.c           # Toàn bộ logic HTTP + DNS
-│
-├── Server/                         # Phía server
-│   ├── api.php                     # REST API (relay + sensor)
-│   ├── relay_state.json            # Tự tạo khi chạy
-│   ├── sensor_latest.json          # Tự tạo khi chạy
-│   └── sensor_history.json         # Tự tạo khi chạy
-│
-├── Web/
-│   └── index.html                  # Dashboard web realtime
-│
-└── Tools/
-    └── test_sensor.py              # Giả lập mạch gửi sensor (Python)
-```
-
----
-
-## 🖥 Server — Cài đặt
-
-### Yêu cầu
-
-- PHP 7.4+ với quyền ghi file
-- Web server: Apache / Nginx / XAMPP / WAMP
-
-### Cài đặt
-
-```bash
-# Copy 2 file lên web server
-cp api.php   /var/www/html/
-cp index.html /var/www/html/
-
-# Cấp quyền ghi (Linux)
-chmod 755 /var/www/html/
-```
-
-> Các file `.json` sẽ tự tạo lần đầu khi có request.
-
----
-
-## 📡 API Reference
-
-**Base URL:** `http://your-server/api.php`
-
----
-
-### Relay
-
-#### Lấy trạng thái tất cả relay
-```
-GET /api.php
-```
-```json
-{
-  "relays": [
-    {"id": 1, "name": "Relay 1", "state": true},
-    {"id": 2, "name": "Relay 2", "state": false}
-  ],
-  "count": 4
-}
-```
-
-#### Lấy trạng thái 1 relay
-```
-GET /api.php?id=1
-```
-```json
-{"id": 1, "name": "Relay 1", "state": true, "value": 1}
-```
-
-#### Cập nhật trạng thái relay
-```
-POST /api.php
-Content-Type: application/json
-
-{"id": 1, "state": true}
-```
-```json
-{"ok": true, "id": 1, "state": true}
-```
-
----
-
-### Sensor (Nhiệt độ / Độ ẩm)
-
-#### Mạch gửi dữ liệu lên
-```
-POST /api.php?action=sensor
-Content-Type: application/json
-
-{
-  "temperature": 28.50,
-  "humidity": 65.20,
-  "device": "STM32"
-}
-```
-> `humidity` và `device` là tuỳ chọn.
-
-```json
-{
-  "ok": true,
-  "received": {
-    "temperature": 28.5,
-    "humidity": 65.2,
-    "device": "STM32",
-    "timestamp": 1747382400,
-    "datetime": "2026-05-16 10:00:00"
-  }
-}
-```
-
-#### Lấy dữ liệu mới nhất
-```
-GET /api.php?action=sensor
-```
-
-#### Lấy lịch sử (tối đa 60 điểm)
-```
-GET /api.php?action=sensor_history&limit=60
-```
-
----
-
-## ⚙️ Cấu hình STM32
-
-### 1. Sửa cấu hình trong `http_client.h`
-
+ 
+## 2. Biến nội bộ
+ 
 ```c
-#define HTTP_HOST           "your-domain.com"   // hoặc IP: "192.168.1.100"
-#define HTTP_SERVER_PORT    80
-#define HTTP_INTERVAL_MS    500    // chu kỳ GET relay (ms)
-#define HTTP_RX_TIMEOUT_MS  5000   // timeout nhận response (ms)
-#define HTTP_SOCKET         1      // socket W5500 dùng cho HTTP
-#define DNS_SOCKET          6      // socket W5500 dùng cho DNS
+static uint8_t  server_ip[4]     = {0};   // IP sau khi DNS resolve
+static bool     ip_resolved      = false; // cờ: đã có IP hay chưa
+static uint8_t  connect_fail_cnt = 0;     // đếm số lần connect thất bại
+ 
+static uint8_t  tx_buf[HTTP_TX_BUF_SIZE]; // buffer chứa request gửi đi (2048 byte)
+static uint8_t  rx_buf[HTTP_RX_BUF_SIZE]; // buffer chứa response nhận về (4096 byte)
+ 
+static uint32_t last_request_tick = 0;    // timestamp lần GET relay cuối
 ```
-
-### 2. Tích hợp vào `main.c`
-
+ 
+Tất cả đều là `static` — tồn tại suốt vòng đời chương trình nhưng **không thể truy cập từ file khác**.
+ 
+`tx_buf` và `rx_buf` được đặt ở mức file (không phải trong hàm) vì kích thước lớn — nếu đặt trong hàm sẽ cấp phát trên **stack**, dễ gây **stack overflow** trên STM32 với RAM hạn chế.
+ 
+---
+ 
+## 3. `float_to_str()`
+ 
+### Vấn đề
+ 
+`newlib-nano` (thư viện C mặc định của STM32 CubeIDE) bỏ hỗ trợ `%f` trong `printf/snprintf` để tiết kiệm flash. Gọi `snprintf("%.2f", val)` sẽ in ra chuỗi rỗng.
+ 
+### Giải pháp
+ 
 ```c
-#include "http_client.h"
-
-// Trong main(), sau khi W5500 đã khởi tạo xong:
-http_client_init();
-
-// Trong while(1):
-while (1)
+static void float_to_str(float val, char *buf, uint8_t bufsize)
 {
-    http_client_run();   // tự GET relay mỗi 500ms, điều khiển GPIO
-
-    // Gửi sensor mỗi 2 giây
-    if (HAL_GetTick() - last_sensor_tick >= 2000)
+    int neg = (val < 0.0f);       // (1) kiểm tra âm
+    if (neg) val = -val;           //     lấy trị tuyệt đối
+ 
+    int32_t whole = (int32_t)val;  // (2) phần nguyên: 28.356 → 28
+    int32_t frac  = (int32_t)((val - (float)whole) * 100.0f + 0.5f);
+    //                         └─ phần lẻ ─┘  × 100  + làm tròn
+    //  28.356 → 0.356 × 100 = 35.6 + 0.5 = 36.1 → (int32_t) = 36
+ 
+    if (frac >= 100) { frac -= 100; whole += 1; }  // (3) xử lý carry
+    //  Ví dụ: 9.999 → frac = 100 → frac=0, whole=10 → "10.00"
+ 
+    snprintf(buf, bufsize, "%s%ld.%02ld",
+             neg ? "-" : "",   // (4) thêm dấu âm nếu cần
+             (long)whole,
+             (long)frac);      //     %02ld đảm bảo luôn 2 chữ số: 5 → "05"
+}
+```
+ 
+**Ví dụ kết quả:**
+ 
+| Input | whole | frac | Output |
+|-------|-------|------|--------|
+| `28.356f` | 28 | 36 | `"28.36"` |
+| `-5.1f` | 5 | 10 | `"-5.10"` |
+| `9.999f` | 9 | 100 → carry | `"10.00"` |
+| `0.05f` | 0 | 5 | `"0.05"` |
+ 
+---
+ 
+## 4. `resolve_server_ip()` — DNS
+ 
+```c
+static int resolve_server_ip(void)
+{
+    uint8_t dns_server[4] = {8, 8, 8, 8};   // Google DNS
+ 
+    int ret = DNS_run(dns_server,
+                      (uint8_t *)"test.caominhkhanh.asia",
+                      server_ip);            // kết quả ghi vào server_ip[]
+ 
+    if (ret == 1)          // W5500 DNS lib: 1 = thành công
     {
-        last_sensor_tick = HAL_GetTick();
-
-        float temp  = read_temperature();   // hàm đọc cảm biến của bạn
-        float humid = read_humidity();       // truyền -1.0f nếu không có
-
-        http_post_sensor(temp, humid, "STM32");
+        ip_resolved      = true;
+        connect_fail_cnt = 0;
+        return 0;
     }
+ 
+    ip_resolved = false;
+    return -1;
 }
 ```
-
-### 3. Thêm relay mới
-
-Mở `http_client.c`, tìm `process_relay_response()` và bỏ comment:
-
+ 
+**Luồng DNS:**
+```
+STM32                          DNS Server (8.8.8.8)
+  │                                    │
+  │── UDP query: "test.caominhkhanh.asia?" ──►│
+  │                                    │
+  │◄── UDP response: "203.x.x.x" ─────│
+  │                                    │
+  server_ip = {203, x, x, x}
+  ip_resolved = true
+```
+ 
+`DNS_run()` sử dụng **socket DNS_SOCKET (số 6)** — socket riêng biệt với HTTP, không xung đột.
+ 
+---
+ 
+## 5. `open_socket()`
+ 
 ```c
-// Relay 2 → PC8
-int s2 = parse_relay_state(json, 2);
-if      (s2 == 1) HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
-else if (s2 == 0) HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET);
+static HTTP_Result open_socket(void)
+{
+    // Dọn socket cũ nếu chưa closed
+    if (getSn_SR(HTTP_SOCKET) != SOCK_CLOSED)
+    {
+        disconnect(HTTP_SOCKET);
+        close(HTTP_SOCKET);
+        HAL_Delay(10);        // chờ W5500 xử lý xong
+    }
+ 
+    // Mở socket TCP mới, bind cổng nguồn 50001
+    if (socket(HTTP_SOCKET, Sn_MR_TCP, 50001, 0) != HTTP_SOCKET)
+        return HTTP_ERR_SOCK;
+ 
+    return HTTP_OK;
+}
 ```
-
-### 4. Gọi GET / POST thủ công
-
+ 
+**Tại sao phải kiểm tra `SOCK_CLOSED` trước?**
+ 
+Nếu request trước bị lỗi giữa chừng (timeout, mất mạng), socket có thể kẹt ở trạng thái `CLOSE_WAIT` hoặc `FIN_WAIT`. Gọi `socket()` trên một socket chưa đóng sẽ thất bại. Đoạn `disconnect → close → delay` đảm bảo W5500 luôn ở trạng thái sạch.
+ 
+**Sơ đồ trạng thái W5500 socket:**
+```
+CLOSED ──socket()──► INIT ──connect()──► ESTABLISHED
+                                              │
+                                         send/recv
+                                              │
+                              disconnect() ──►│
+                                         CLOSE_WAIT
+                                              │
+                               close() ───────►CLOSED
+```
+ 
+---
+ 
+## 6. `tcp_connect()`
+ 
 ```c
-char resp[256];
-
-// GET bất kỳ path
-http_get("/api.php?id=1", resp, sizeof(resp));
-
-// POST JSON tuỳ ý
-http_post("/api.php", "{\"id\":2,\"state\":true}", resp, sizeof(resp));
-
-// Gửi sensor (wrapper)
-http_post_sensor(28.5f, 65.0f, "STM32");
+static HTTP_Result tcp_connect(void)
+{
+    int ret = connect(HTTP_SOCKET, server_ip, HTTP_SERVER_PORT);
+ 
+    if (ret != SOCK_OK)
+    {
+        connect_fail_cnt++;
+ 
+        // Nếu thất bại liên tục CONNECT_FAIL_MAX lần → IP có thể đã đổi
+        // → đặt ip_resolved = false để lần sau resolve DNS lại
+        if (connect_fail_cnt >= CONNECT_FAIL_MAX)
+            ip_resolved = false;
+ 
+        close(HTTP_SOCKET);
+        return HTTP_ERR_CONN;
+    }
+ 
+    connect_fail_cnt = 0;      // reset bộ đếm nếu thành công
+    HAL_Delay(200);            // chờ TCP handshake ổn định
+    return HTTP_OK;
+}
 ```
-
+ 
+**TCP 3-way handshake (diễn ra bên trong `connect()`):**
+```
+STM32 (client)              Server
+     │                         │
+     │──── SYN ───────────────►│
+     │                         │
+     │◄─── SYN-ACK ────────────│
+     │                         │
+     │──── ACK ───────────────►│
+     │                         │
+     │    ESTABLISHED          │
+```
+ 
+**Cơ chế re-resolve DNS:**
+ 
+```
+connect() thất bại → connect_fail_cnt++
+                          │
+              connect_fail_cnt >= 3?
+                    │           │
+                   Có          Không
+                    │           │
+          ip_resolved = false  tiếp tục
+                    │
+        lần sau ensure_ip() sẽ gọi DNS lại
+```
+ 
 ---
-
-## 🌐 Giao diện Web
-
-Mở `http://your-server/index.html`
-
-| Khu vực | Mô tả |
-|---------|-------|
-| **Status bar** | Trạng thái kết nối, đồng hồ realtime, số relay đang bật |
-| **Card nhiệt độ** | Giá trị hiện tại + gauge ring (thang 0–80°C) |
-| **Card độ ẩm** | Giá trị hiện tại + gauge ring (0–100%) |
-| **Device info** | Tên thiết bị, thời gian cập nhật, LIVE / OFFLINE |
-| **Biểu đồ lịch sử** | Hiện khi có ≥ 2 điểm dữ liệu (tối đa 60 điểm) |
-| **Relay cards** | Toggle bật/tắt từng relay, hiệu ứng pulse khi ON |
-| **Bật/Tắt tất cả** | Điều khiển đồng loạt tất cả relay |
-
-> Web tự poll relay mỗi **3 giây**, sensor mỗi **2 giây**.  
-> Trạng thái **OFFLINE** hiện khi không nhận được dữ liệu trong > 10 giây.
-
----
-
-## 🐍 Test bằng Python
-
-Dùng `test_sensor.py` để giả lập mạch gửi dữ liệu mà không cần phần cứng.
-
-```bash
-pip install requests
-python test_sensor.py
-```
-
-Mở `test_sensor.py` và sửa URL:
-```python
-API_URL = "http://your-server/api.php?action=sensor"
-```
-
-Output mẫu:
-```
-╔══════════════════════════════════════════════════╗
-║       SENSOR API TEST — Python Simulator         ║
-╚══════════════════════════════════════════════════╝
-  URL    : http://your-server/api.php?action=sensor
-  Device : STM32-SIM
-  Chu kỳ: 2s  |  Nhấn Ctrl+C để dừng
-
-     #  Thời gian     Nhiệt độ    Độ ẩm  Status
-  ───────────────────────────────────────────────────────
-     1  14:32:01      28.14 °C   65.3 %  ✓ OK
-     2  14:32:03      28.31 °C   64.9 %  ✓ OK
-```
-
----
-
-## 📝 Lưu ý kỹ thuật
-
-### Float không cần `-u _printf_float`
-STM32 CubeIDE mặc định dùng `newlib-nano`, không hỗ trợ `%f` trong `snprintf`.  
-Project này dùng hàm `float_to_str()` tự viết — không cần thêm flag linker, tiết kiệm ~8KB flash.
-
+ 
+## 7. `tcp_send()`
+ 
 ```c
-// Thay vì: snprintf(buf, size, "%.2f", val);  ← lỗi trên nano
-// Dùng:
-char s[16];
-float_to_str(val, s, sizeof(s));
-snprintf(buf, size, "%s", s);                   // ✓ OK
+static HTTP_Result tcp_send(const uint8_t *data, uint16_t len)
+{
+    int ret = send(HTTP_SOCKET, (uint8_t *)data, len);
+ 
+    if (ret <= 0)
+    {
+        disconnect(HTTP_SOCKET);
+        close(HTTP_SOCKET);
+        return HTTP_ERR_SEND;
+    }
+ 
+    HAL_Delay(200);   // chờ server nhận và bắt đầu xử lý
+    return HTTP_OK;
+}
 ```
-
-### CORS
-`api.php` đã bật `Access-Control-Allow-Origin: *` — web có thể chạy ở domain khác với server.
-
-### Bảo mật
-Để triển khai production, nên:
-- Thêm API key vào header request
-- Giới hạn IP truy cập vào `api.php`
-- Dùng HTTPS thay HTTP
-
+ 
+`send()` của W5500 sẽ copy `data` vào TX buffer của chip, rồi chip tự lo truyền qua mạng. Hàm này **không blocking** theo nghĩa chờ server xác nhận — nó trả về ngay khi đã đẩy vào buffer.
+ 
+**Ví dụ nội dung `data` với GET:**
+```
+GET /api.php HTTP/1.1\r\n
+Host: test.caominhkhanh.asia\r\n
+Connection: close\r\n
+\r\n
+```
+ 
+**Ví dụ nội dung `data` với POST:**
+```
+POST /api.php?action=sensor HTTP/1.1\r\n
+Host: test.caominhkhanh.asia\r\n
+Content-Type: application/json\r\n
+Content-Length: 45\r\n
+Connection: close\r\n
+\r\n
+{"temperature":28.35,"humidity":65.20,"device":"STM32"}
+```
+ 
+`Content-Length` phải **chính xác** — server dùng con số này để biết body kết thúc ở đâu. Code tính bằng `strlen(json_body)` trước khi build request.
+ 
 ---
-
-## 📄 License
-
-MIT License — tự do sử dụng, chỉnh sửa và phân phối.
+ 
+## 8. `tcp_receive()`
+ 
+Đây là hàm phức tạp nhất — cần nhận toàn bộ response có thể đến theo nhiều chunk:
+ 
+```c
+static int tcp_receive(void)
+{
+    int32_t  total  = 0;
+    uint32_t t_last = HAL_GetTick();   // mốc thời gian bắt đầu
+ 
+    memset(rx_buf, 0, sizeof(rx_buf));
+ 
+    while ((HAL_GetTick() - t_last) < HTTP_RX_TIMEOUT_MS)   // (A)
+    {
+        int32_t avail = getSn_RX_RSR(HTTP_SOCKET);   // (B) hỏi W5500: có bao nhiêu byte?
+ 
+        if (avail > 0)
+        {
+            // (C) giới hạn không vượt quá buffer
+            if (total + avail >= (int32_t)(sizeof(rx_buf) - 1))
+                avail = (int32_t)(sizeof(rx_buf) - 1 - total);
+ 
+            if (avail <= 0) break;
+ 
+            // (D) đọc dữ liệu, nối tiếp vào rx_buf
+            int32_t ret = recv(HTTP_SOCKET, &rx_buf[total], avail);
+ 
+            if (ret > 0)
+            {
+                total += ret;
+                t_last = HAL_GetTick();   // (E) reset timeout mỗi khi có dữ liệu mới
+            }
+        }
+ 
+        // (F) kiểm tra server có đóng kết nối không
+        uint8_t sr = getSn_SR(HTTP_SOCKET);
+        if (sr == SOCK_CLOSE_WAIT || sr == SOCK_CLOSED)
+        {
+            disconnect(HTTP_SOCKET);
+            close(HTTP_SOCKET);
+            break;   // server đóng = response đã hoàn tất
+        }
+ 
+        HAL_Delay(1);   // nhường CPU, tránh spin-wait 100%
+    }
+ 
+    rx_buf[total] = '\0';   // (G) null-terminate để dùng như string
+    return (total > 0) ? (int)total : -1;
+}
+```
+ 
+**Tại sao cần vòng lặp thay vì 1 lần `recv()`?**
+ 
+TCP là giao thức stream — dữ liệu có thể đến theo nhiều đợt (fragmentation). Ví dụ response 800 byte có thể đến thành 3 chunk: 200 + 400 + 200 byte.
+ 
+```
+Lần 1: getSn_RX_RSR() = 200  → recv() 200 byte, total=200, reset t_last
+Lần 2: getSn_RX_RSR() = 0    → chờ
+Lần 3: getSn_RX_RSR() = 400  → recv() 400 byte, total=600, reset t_last
+Lần 4: getSn_RX_RSR() = 200  → recv() 200 byte, total=800, reset t_last
+Lần 5: getSn_SR() = CLOSE_WAIT → break, done
+```
+ 
+**Cơ chế timeout kép:**
+ 
+| Điều kiện thoát | Ý nghĩa |
+|----------------|---------|
+| `SOCK_CLOSE_WAIT` | Server đóng kết nối sau khi gửi xong (bình thường) |
+| `SOCK_CLOSED` | Kết nối đã đóng hoàn toàn |
+| Timeout `HTTP_RX_TIMEOUT_MS` | Server không phản hồi trong 5 giây |
+ 
+Timeout **reset mỗi khi nhận được byte mới** (điểm E) — nên không bị timeout oan khi đang nhận dữ liệu chậm.
+ 
+---
+ 
+## 9. `extract_body()`
+ 
+HTTP response có cấu trúc:
+ 
+```
+HTTP/1.1 200 OK\r\n                ← status line
+Content-Type: application/json\r\n ← headers
+Content-Length: 85\r\n             │
+\r\n                               ← dòng trống phân cách (CRLFCRLF)
+{"relays":[...]}                   ← body (phần ta cần)
+```
+ 
+```c
+static char *extract_body(char *out_body, uint16_t out_size)
+{
+    // Tìm chuỗi "\r\n\r\n" — ranh giới header/body
+    char *body = strstr((char *)rx_buf, "\r\n\r\n");
+ 
+    if (body == NULL) return NULL;
+ 
+    body += 4;   // nhảy qua 4 ký tự "\r\n\r\n" để trỏ vào đầu body
+ 
+    // Copy sang buffer của caller nếu có yêu cầu
+    if (out_body != NULL && out_size > 0)
+    {
+        strncpy(out_body, body, out_size - 1);
+        out_body[out_size - 1] = '\0';   // đảm bảo null-terminated
+    }
+ 
+    return body;   // trả về pointer vào rx_buf (tránh copy thêm)
+}
+```
+ 
+**Tại sao `out_size - 1`?**
+ 
+`strncpy` copy đúng `n` byte nhưng **không đảm bảo null-terminate** nếu source dài hơn `n`. Ghi `'\0'` tại vị trí cuối là bắt buộc để tránh đọc tràn bộ nhớ.
+ 
+---
+ 
+## 10. `do_request()` — Lõi chung
+ 
+```c
+static HTTP_Result do_request(char *out_body, uint16_t out_size)
+{
+    HTTP_Result r;
+ 
+    r = open_socket();  if (r != HTTP_OK) return r;   // bước 1
+    r = tcp_connect();  if (r != HTTP_OK) return r;   // bước 2
+ 
+    r = tcp_send(tx_buf, strlen(tx_buf));              // bước 3
+    if (r != HTTP_OK) return r;
+ 
+    if (tcp_receive() <= 0) return HTTP_ERR_RECV;      // bước 4
+ 
+    extract_body(out_body, out_size);                  // bước 5
+    return HTTP_OK;
+}
+```
+ 
+Pattern `if (r != HTTP_OK) return r` gọi là **early return** — dừng ngay khi có lỗi, không thực hiện các bước tiếp theo. Giúp code dễ đọc hơn nhiều so với lồng `if-else`.
+ 
+`http_get()` và `http_post()` chỉ khác nhau ở **nội dung `tx_buf`** — cả hai đều kết thúc bằng cùng 1 lời gọi `do_request()`.
+ 
+---
+ 
+## 11. `parse_relay_state()`
+ 
+```c
+static int parse_relay_state(const char *json, int relay_id)
+{
+    char  pattern[32];
+    char *p = NULL;
+ 
+    // (1) thử tìm "id": 1  (có khoảng trắng)
+    snprintf(pattern, sizeof(pattern), "\"id\": %d", relay_id);
+    p = strstr(json, pattern);
+ 
+    // (2) nếu không có, thử "id":1  (không khoảng trắng)
+    if (p == NULL)
+    {
+        snprintf(pattern, sizeof(pattern), "\"id\":%d", relay_id);
+        p = strstr(json, pattern);
+    }
+ 
+    if (p == NULL) return -1;   // không tìm thấy relay này
+ 
+    // (3) từ vị trí id tìm thấy, tìm tiếp "state":
+    char *sp = strstr(p, "\"state\":");
+    if (sp == NULL) return -1;
+ 
+    sp += strlen("\"state\":");   // nhảy qua "state":
+    while (*sp == ' ') sp++;      // bỏ khoảng trắng thừa
+ 
+    // (4) so sánh chuỗi tiếp theo
+    if (strncmp(sp, "true",  4) == 0) return 1;
+    if (strncmp(sp, "false", 5) == 0) return 0;
+ 
+    return -1;   // giá trị không hợp lệ
+}
+```
+ 
+**Ví dụ parse JSON thực tế:**
+ 
+```
+JSON: {"relays":[{"id":1,"name":"Relay 1","state":true},{"id":2,...}]}
+ 
+relay_id = 1:
+  (1) tìm '"id":1'       → tìm thấy tại vị trí X
+  (3) tìm '"state":'     → tìm thấy sau đó
+  (4) so sánh 'true'     → return 1
+```
+ 
+**Tại sao tìm `"id":` rồi mới tìm `"state":` thay vì tìm `"state":` thẳng?**
+ 
+Vì JSON có nhiều relay, mỗi relay có field `"state"`. Nếu tìm `"state":` thẳng sẽ luôn lấy relay đầu tiên. Cần tìm đúng block của `relay_id` trước.
+ 
+---
+ 
+## 12. `process_relay_response()`
+ 
+```c
+static void process_relay_response(const char *json)
+{
+    int s1 = parse_relay_state(json, 1);   // lấy state của relay ID=1
+ 
+    if (s1 == 1)
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_RESET);  // kéo LOW → relay ON
+    else if (s1 == 0)
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_SET);    // kéo HIGH → relay OFF
+    // s1 == -1: parse lỗi, giữ nguyên trạng thái GPIO → an toàn
+}
+```
+ 
+**Tại sao ACTIVE LOW?**
+ 
+Module relay thông dụng (SRD-05VDC) kích hoạt khi IN ở mức LOW. Khi mất điện hoặc mất kết nối, GPIO mặc định HIGH → relay ở trạng thái OFF (an toàn).
+ 
+```
+IN = LOW  (GPIO_PIN_RESET) → Relay cuộn dây có dòng → tiếp điểm đóng → TẢI ON
+IN = HIGH (GPIO_PIN_SET)   → Relay không có dòng    → tiếp điểm mở  → TẢI OFF
+```
+ 
+---
+ 
+## 13. `http_get()` / `http_post()`
+ 
+### http_get()
+ 
+```c
+HTTP_Result http_get(const char *path, char *out_body, uint16_t out_size)
+{
+    HTTP_Result r = ensure_ip();    // đảm bảo có IP trước
+    if (r != HTTP_OK) return r;
+ 
+    // Build HTTP request vào tx_buf
+    snprintf((char *)tx_buf, sizeof(tx_buf),
+             "GET %s HTTP/1.1\r\n"
+             "Host: %s\r\n"
+             "Connection: close\r\n"   // yêu cầu server đóng sau response
+             "\r\n",
+             path, HTTP_HOST);
+ 
+    return do_request(out_body, out_size);
+}
+```
+ 
+**`Connection: close` — tại sao?**
+ 
+HTTP/1.1 mặc định `keep-alive` (giữ kết nối cho request tiếp theo). Với STM32, ta không dùng keep-alive vì mỗi request mở socket mới. Dùng `close` để server tự đóng sau khi gửi response — đây là tín hiệu để `tcp_receive()` biết response đã hoàn tất.
+ 
+### http_post()
+ 
+```c
+HTTP_Result http_post(const char *path, const char *json_body,
+                      char *out_body, uint16_t out_size)
+{
+    HTTP_Result r = ensure_ip();
+    if (r != HTTP_OK) return r;
+ 
+    uint16_t body_len = (uint16_t)strlen(json_body);   // tính trước
+ 
+    snprintf((char *)tx_buf, sizeof(tx_buf),
+             "POST %s HTTP/1.1\r\n"
+             "Host: %s\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %u\r\n"    // bắt buộc với POST
+             "Connection: close\r\n"
+             "\r\n"
+             "%s",                       // body nối thẳng vào
+             path, HTTP_HOST, body_len, json_body);
+ 
+    return do_request(out_body, out_size);
+}
+```
+ 
+**Sự khác biệt GET vs POST:**
+ 
+| | GET | POST |
+|-|-----|------|
+| Body | Không có | JSON string |
+| Header thêm | Không | `Content-Type`, `Content-Length` |
+| Mục đích | Lấy dữ liệu | Gửi dữ liệu lên |
+| Idempotent | Có (gọi nhiều lần = kết quả như nhau) | Không |
+ 
+---
+ 
+## 14. `http_post_sensor()`
+ 
+```c
+HTTP_Result http_post_sensor(float temperature, float humidity, const char *device)
+{
+    char json[128];
+    char t_str[16];
+    char h_str[16];
+ 
+    float_to_str(temperature, t_str, sizeof(t_str));   // 28.356f → "28.36"
+ 
+    if (humidity >= 0.0f)
+    {
+        float_to_str(humidity, h_str, sizeof(h_str));
+        snprintf(json, sizeof(json),
+                 "{\"temperature\":%s,\"humidity\":%s,\"device\":\"%s\"}",
+                 t_str, h_str, device);
+        // → {"temperature":28.36,"humidity":65.20,"device":"STM32"}
+    }
+    else
+    {
+        // humidity = -1.0f → không có cảm biến độ ẩm
+        snprintf(json, sizeof(json),
+                 "{\"temperature\":%s,\"device\":\"%s\"}",
+                 t_str, device);
+        // → {"temperature":28.36,"device":"STM32"}
+    }
+ 
+    return http_post("/api.php?action=sensor", json, NULL, 0);
+    //                                               ^^^^ ^^^
+    //                              không cần đọc response body
+}
+```
+ 
+Truyền `NULL, 0` cho `out_body, out_size` khi không cần đọc response — hàm `extract_body()` kiểm tra `out_body != NULL` trước khi copy, nên hoàn toàn an toàn.
+ 
+---
+ 
+## 15. `http_client_init()` / `http_client_run()`
+ 
+### http_client_init()
+ 
+```c
+void http_client_init(void)
+{
+    // Đặt tick về "quá khứ" để lần gọi run() đầu tiên chạy ngay
+    last_request_tick = HAL_GetTick() - HTTP_INTERVAL_MS;
+ 
+    resolve_server_ip();   // resolve DNS ngay khi khởi động
+}
+```
+ 
+Trick `HAL_GetTick() - HTTP_INTERVAL_MS`: nếu không làm vậy, lần đầu gọi `http_client_run()`, điều kiện `(now - last_request_tick) < HTTP_INTERVAL_MS` sẽ là `(500 - 0) < 500 = false` → phải chờ 500ms mới chạy. Trick này làm request đầu tiên chạy **ngay lập tức**.
+ 
+### http_client_run()
+ 
+```c
+void http_client_run(void)
+{
+    uint32_t now = HAL_GetTick();
+ 
+    // Chưa đến chu kỳ → thoát ngay, không block
+    if ((now - last_request_tick) < HTTP_INTERVAL_MS)
+        return;
+ 
+    last_request_tick = now;
+ 
+    char body[512] = {0};
+    HTTP_Result r = http_get("/api.php", body, sizeof(body));
+ 
+    if (r == HTTP_OK && body[0] != '\0')
+        process_relay_response(body);
+}
+```
+ 
+**Tại sao dùng `(now - last_request_tick)` thay vì `now > last_request_tick + interval`?**
+ 
+`HAL_GetTick()` trả về `uint32_t` — sau ~49.7 ngày sẽ **overflow về 0**. Phép trừ `uint32_t` tự động wrap-around đúng, còn phép cộng `last_request_tick + interval` có thể overflow và so sánh sai.
+ 
+```
+// Ví dụ overflow-safe:
+last = 0xFFFFFFF0, now = 0x00000010, interval = 500
+now - last = 0x10 - 0xFFFFFFF0 = 0x20 = 32  (đúng, wrap-around)
+ 
+// Nếu dùng cộng (sai):
+last + interval = 0xFFFFFFF0 + 500 = 0x000001E4  (overflow, so sánh sai)
+```
+ 
+---
+ 
+## 16. Luồng dữ liệu đầy đủ
+ 
+### Luồng GET relay (mỗi 500ms)
+ 
+```
+http_client_run()
+    │
+    ├─ kiểm tra tick → chưa đủ 500ms → return
+    │
+    └─ đủ 500ms:
+        │
+        http_get("/api.php", body, 512)
+            │
+            ensure_ip() → ip_resolved? → Không → resolve_server_ip()
+            │
+            build tx_buf:
+            │  "GET /api.php HTTP/1.1\r\n
+            │   Host: ...\r\n
+            │   Connection: close\r\n\r\n"
+            │
+            do_request()
+                │
+                open_socket()   → SOCK_CLOSED → socket(TCP, port 50001)
+                │
+                tcp_connect()   → connect(server_ip, 80)
+                │                  [TCP 3-way handshake]
+                │
+                tcp_send()      → send(tx_buf)  → W5500 → Internet → Server
+                │
+                tcp_receive()   → loop:
+                │                   getSn_RX_RSR() > 0 → recv() → rx_buf
+                │                   getSn_SR() == CLOSE_WAIT → break
+                │
+                extract_body()  → tìm "\r\n\r\n" → copy body vào out_body
+                │
+                return HTTP_OK
+            │
+        process_relay_response(body)
+            │
+            parse_relay_state(json, 1) → tìm "id":1 → "state":true → return 1
+            │
+            HAL_GPIO_WritePin(GPIOC, PIN_9, RESET)  → Relay 1 ON
+```
+ 
+### Luồng POST sensor (mỗi 2s, từ main.c)
+ 
+```
+http_post_sensor(28.35f, 65.2f, "STM32")
+    │
+    float_to_str(28.35f) → "28.35"
+    float_to_str(65.2f)  → "65.20"
+    │
+    json = '{"temperature":28.35,"humidity":65.20,"device":"STM32"}'
+    │
+    http_post("/api.php?action=sensor", json, NULL, 0)
+        │
+        ensure_ip()
+        │
+        build tx_buf:
+        │  "POST /api.php?action=sensor HTTP/1.1\r\n
+        │   Host: ...\r\n
+        │   Content-Type: application/json\r\n
+        │   Content-Length: 57\r\n
+        │   Connection: close\r\n\r\n
+        │   {"temperature":28.35,...}"
+        │
+        do_request(NULL, 0)
+            │
+            [socket → connect → send → receive → extract_body(NULL,0)]
+            │
+            return HTTP_OK
+```
+ 
+---
+ 
+## 17. Các lỗi thường gặp
+ 
+| Mã lỗi | Nguyên nhân | Cách xử lý |
+|--------|-------------|------------|
+| `HTTP_ERR_DNS (-1)` | Không resolve được domain | Kiểm tra DNS_SOCKET, kết nối mạng, domain đúng chưa |
+| `HTTP_ERR_SOCK (-2)` | Không mở được socket W5500 | Kiểm tra SPI, W5500 có hoạt động không |
+| `HTTP_ERR_CONN (-3)` | Không kết nối được TCP | Server có đang chạy không? Firewall? Port 80 mở chưa? |
+| `HTTP_ERR_SEND (-4)` | Gửi request thất bại | Kết nối bị ngắt giữa chừng |
+| `HTTP_ERR_RECV (-5)` | Không nhận được response | Tăng `HTTP_RX_TIMEOUT_MS`, kiểm tra server response |
+| `HTTP_ERR_PARSE (-6)` | Không parse được JSON | Kiểm tra format JSON server trả về |
+ 
+**Debug nhanh:** Bật UART và theo dõi log `[HTTP]` — mỗi bước đều có `printf` thông báo rõ.
