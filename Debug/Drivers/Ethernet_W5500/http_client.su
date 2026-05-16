@@ -1,0 +1,16 @@
+../Drivers/Ethernet_W5500/http_client.c:13:13:float_to_str	56	static
+../Drivers/Ethernet_W5500/http_client.c:49:12:resolve_server_ip	24	static
+../Drivers/Ethernet_W5500/http_client.c:75:20:open_socket	8	static
+../Drivers/Ethernet_W5500/http_client.c:96:20:tcp_connect	24	static
+../Drivers/Ethernet_W5500/http_client.c:127:20:tcp_send	24	static
+../Drivers/Ethernet_W5500/http_client.c:147:12:tcp_receive	32	static
+../Drivers/Ethernet_W5500/http_client.c:201:14:extract_body	24	static
+../Drivers/Ethernet_W5500/http_client.c:225:20:ensure_ip	8	static
+../Drivers/Ethernet_W5500/http_client.c:239:20:do_request	24	static
+../Drivers/Ethernet_W5500/http_client.c:258:12:parse_relay_state	56	static
+../Drivers/Ethernet_W5500/http_client.c:289:13:process_relay_response	24	static
+../Drivers/Ethernet_W5500/http_client.c:322:13:http_get	40	static
+../Drivers/Ethernet_W5500/http_client.c:340:13:http_post	48	static
+../Drivers/Ethernet_W5500/http_client.c:364:13:http_post_sensor	192	static
+../Drivers/Ethernet_W5500/http_client.c:393:6:http_client_init	8	static
+../Drivers/Ethernet_W5500/http_client.c:403:6:http_client_run	528	static
